@@ -1,0 +1,2 @@
+# singlife
+React Query integration
