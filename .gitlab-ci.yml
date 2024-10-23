@@ -1,0 +1,409 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event"
+
+default:
+  interruptible: true
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/License-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+image:
+  name: $DEFAULT_IMAGE_REGISTRY_ID.dkr.ecr.ap-southeast-1.amazonaws.com/gitlab-netstorage-runner:latest
+
+variables:
+  DEFAULT_IMAGE_REGISTRY_ID: 788849751174
+  TARGET_ENVIRONMENT:
+    value: "dev"
+    description: "Target environment for deployment. Values: dev, uat, prd, dr"
+  UAT_ENVIRONMENT:
+    value: "cp4"
+    description: "UAT environment. Values: cp1, cp2, cp3, cp4"
+  RUNNER_TAG:
+    value: "np"
+    description: "Type of runner. Values: np, prd"
+  ENABLE_WALKME:
+    value: "true"
+    description: "Enables WalkMe features. Values: true, false"
+  DEPLOY_CC_DEV:
+    value: "disabled"
+    description: "Enable deployment for Claims dev. Values: enabled, disabled"
+  DEPLOY_ESERVICE_DEV:
+    value: "disabled"
+    description: "Enable deployment for eService dev. Values: enabled, disabled"
+
+.install_node_dependencies: &install_node_dependencies
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  before_script:
+    - echo "@mysinglife:registry=https://${CI_SERVER_HOST}/api/v4/projects/2672/packages/npm/">.npmrc
+    - echo "//${CI_SERVER_HOST}/api/v4/projects/2672/packages/npm/:_authToken=${CI_JOB_TOKEN}">.npmrc
+    - npm ci --cache .npm --prefer-offline --ignore-scripts
+
+.dev_global_variables_script: &dev_global_variables_script
+  - export ENV_VARIABLE=$ENV_DEV
+  - export ENVIRONMENT=$(echo $ENV_VARIABLE | jq -r .ENVIRONMENT)
+  - export ROLE=$(echo $ENV_VARIABLE | jq -r .ROLE)
+  - export REGION=$(echo $ENV_VARIABLE | jq -r .REGION)
+  - export AMS_CLI_REGION=$(echo $ENV_VARIABLE | jq -r .AMS_CLI_REGION)
+  - export TAG=$(echo $ENV_VARIABLE | jq -r .TAG)
+  - export CUSTOMER_DEPLOY_BUCKET_NAME=$CUSTOMER_DEPLOY_BUCKET_NAME_DEV
+  - export STAFF_DEPLOY_BUCKET_NAME=$STAFF_DEPLOY_BUCKET_NAME_DEV
+  - export CLAIM_CONNECT_DEPLOY_BUCKET_NAME=$CLAIM_CONNECT_DEPLOY_BUCKET_NAME_DEV
+
+.assumerole_script: &assumerole_script
+  - result=$(aws sts assume-role --role-arn $ROLE --role-session-name "deployment-$TAG")
+  - export AWS_DEFAULT_REGION=$REGION
+  - export AWS_ACCESS_KEY_ID=$(echo $result | jq -r .Credentials.AccessKeyId)
+  - export AWS_SECRET_ACCESS_KEY=$(echo $result | jq -r .Credentials.SecretAccessKey)
+  - export AWS_SESSION_TOKEN=$(echo $result | jq -r .Credentials.SessionToken)
+
+.show_jobs_in_dev_pipeline: &show_jobs_in_dev_pipeline
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev"
+
+###### -------- To AWS_ECR_AUTH. Need to add AWS_ECR_AUTH into CI/CD pipeline so that curl can update with the AUTH  --------######
+.ecr_authorization_nestorage_token_script:
+  &ecr_authorization_nestorage_token_script
+  - AUTH=$(aws ecr get-authorization-token --registry-ids $DEFAULT_IMAGE_REGISTRY_ID --output text --query 'authorizationData[].authorizationToken')
+  - curl --request PUT --header "PRIVATE-TOKEN:$GITLAB_TOKEN" --silent --output /dev/null --show-error --fail "https://gitlab.tooling.prd.intranet.singlife.com/api/v4/projects/$CI_PROJECT_ID/variables/AWS_ECR_AUTH" --form "value=$AUTH"
+
+stages:
+  - get_ecr_authorization_token
+  - lint
+  - test
+  - build-customer
+  - deploy-customer
+  - build-staff
+  - deploy-staff
+  - upload-nexus
+  - deploy-eservice
+  - deploy-claimconnect
+
+###### -------- GET ECR STAGE  --------######
+.GET_ECR_AUTHORIZATION_TOKEN_template:
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  stage: get_ecr_authorization_token
+  script:
+    - yum install jq -y
+    - *ecr_authorization_nestorage_token_script
+
+GET_ECR_AUTHORIZATION_TOKEN_NP:
+  extends: .GET_ECR_AUTHORIZATION_TOKEN_template
+  tags:
+    - np
+  rules:
+    - if: '($TARGET_ENVIRONMENT == "dev" || $TARGET_ENVIRONMENT == "uat") && $GITLAB_TOKEN != ""'
+
+GET_ECR_AUTHORIZATION_TOKEN_PRD:
+  extends: .GET_ECR_AUTHORIZATION_TOKEN_template
+  tags:
+    - prd
+  rules:
+    - if: '($TARGET_ENVIRONMENT == "prd" || $TARGET_ENVIRONMENT == "dr") && $GITLAB_TOKEN != ""'
+
+########## LINT STAGE ##########
+Lint:
+  <<: *show_jobs_in_dev_pipeline
+  <<: *install_node_dependencies
+  stage: lint
+  tags:
+    - $RUNNER_TAG
+  script:
+    - npm run eslint
+    - npm run lint:type
+    - npm run stylelint
+
+########## SAST STAGE ##########
+secret_detection:
+  <<: *show_jobs_in_dev_pipeline
+  needs: []
+  tags:
+    - prd
+
+license_scanning:
+  <<: *show_jobs_in_dev_pipeline
+  needs: []
+  tags:
+    - prd
+
+gemnasium-dependency_scanning:
+  <<: *show_jobs_in_dev_pipeline
+  needs: []
+  tags:
+    - prd
+
+nodejs-scan-sast:
+  <<: *show_jobs_in_dev_pipeline
+  needs: []
+  tags:
+    - prd
+
+semgrep-sast:
+  <<: *show_jobs_in_dev_pipeline
+  needs: []
+  tags:
+    - prd
+
+########## TEST STAGE ##########
+Test Unit:
+  <<: *install_node_dependencies
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev" && $CI_COMMIT_REF_PROTECTED == "true"
+  stage: test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  tags:
+    - $RUNNER_TAG
+  script:
+    - npm run test:unit
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+
+########## BUILD AND DEPLOY DEV ##########
+.build_dev_jobs_template: &build_dev_jobs_template
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev"
+      when: on_success
+
+.show_deploy_dev_jobs_rules: &show_deploy_dev_jobs_rules
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev"
+      when: manual
+      allow_failure: true
+
+Build Customer Dev:
+  <<: *build_dev_jobs_template
+  <<: *install_node_dependencies
+  stage: build-customer
+  tags:
+    - $RUNNER_TAG
+  artifacts:
+    paths: [build/*]
+  variables:
+    REACT_APP_ENABLE_WALKME: $ENABLE_WALKME
+    REACT_APP_USER_MODE: "customer"
+    BUILD_PATH: "./build"
+  script:
+    - npm run build:ci
+
+Deploy Customer Dev:
+  <<: *show_deploy_dev_jobs_rules
+  stage: deploy-customer
+  dependencies: ["Build Customer Dev"]
+  environment:
+    name: $TARGET_ENVIRONMENT/customer
+  tags:
+    - $RUNNER_TAG
+  script:
+    - *dev_global_variables_script
+    - *assumerole_script
+    - aws --version
+    - aws s3 rm s3://$CUSTOMER_DEPLOY_BUCKET_NAME --recursive
+    - aws s3 cp build s3://$CUSTOMER_DEPLOY_BUCKET_NAME --recursive
+
+Deploy eService Dev:
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev" && $DEPLOY_ESERVICE_DEV == "enabled"
+      when: on_success
+  stage: deploy-eservice
+  dependencies: ["Build Customer Dev"]
+  environment:
+    name: $TARGET_ENVIRONMENT/customer
+  tags:
+    - $RUNNER_TAG
+  script:
+    - *dev_global_variables_script
+    - *assumerole_script
+    - aws --version
+    - aws s3 rm s3://$ESERVICE_DEPLOY_BUCKET_NAME_DEV --recursive
+    - aws s3 cp build s3://$ESERVICE_DEPLOY_BUCKET_NAME_DEV --recursive
+
+Build Staff Dev:
+  <<: *build_dev_jobs_template
+  <<: *install_node_dependencies
+  stage: build-staff
+  tags:
+    - $RUNNER_TAG
+  artifacts:
+    paths: [build/*]
+  variables:
+    REACT_APP_ENABLE_WALKME: $ENABLE_WALKME
+    REACT_APP_USER_MODE: "staff"
+    BUILD_PATH: "./build"
+  script:
+    - npm run build:ci
+
+Deploy Staff Dev:
+  <<: *show_deploy_dev_jobs_rules
+  stage: deploy-staff
+  dependencies: ["Build Staff Dev"]
+  environment:
+    name: $TARGET_ENVIRONMENT/staff
+  tags:
+    - $RUNNER_TAG
+  script:
+    - *dev_global_variables_script
+    - *assumerole_script
+    - aws --version
+    - aws s3 rm s3://$STAFF_DEPLOY_BUCKET_NAME --recursive
+    - aws s3 cp build s3://$STAFF_DEPLOY_BUCKET_NAME --recursive
+
+Deploy ClaimConnect Dev:
+  stage: deploy-claimconnect
+  rules:
+    - if: $TARGET_ENVIRONMENT == "dev" && $DEPLOY_CC_DEV == "enabled"
+      when: on_success
+  dependencies:
+    - Build Customer Dev
+  environment:
+    name: $TARGET_ENVIRONMENT-cc/customer
+  tags:
+    - $RUNNER_TAG
+  script:
+    - *dev_global_variables_script
+    - *assumerole_script
+    - aws --version
+    - aws s3 rm s3://$CLAIM_CONNECT_DEPLOY_BUCKET_NAME --recursive
+    - aws s3 cp build s3://$CLAIM_CONNECT_DEPLOY_BUCKET_NAME --recursive
+
+########## BUILD UAT / PRD / DR ##########
+.build_jobs_template: &build_jobs_template
+  rules:
+    - if: $GITLAB_TOKEN != "" && ($TARGET_ENVIRONMENT == "uat" || $TARGET_ENVIRONMENT == "prd" || $TARGET_ENVIRONMENT == "dr")
+
+Build Customer:
+  <<: *build_jobs_template
+  <<: *install_node_dependencies
+  stage: build-customer
+  tags:
+    - $RUNNER_TAG
+  artifacts:
+    paths: [build/*]
+  variables:
+    REACT_APP_ENABLE_WALKME: $ENABLE_WALKME
+    BUILD_PATH: "./build"
+    REACT_APP_USER_MODE: "customer"
+    REACT_APP_ENV: $TARGET_ENVIRONMENT
+  rules:
+    - if: $UAT_ENVIRONMENT == "cp1"
+      variables:
+        REACT_APP_UAT_MSL_BE_API: "https://uatcp-api-mysinglife.singlife.com"
+        REACT_APP_UAT_FLEX_API: "https://uat-gw.singlife.com/uat-ext/pub/msl"
+    - if: $UAT_ENVIRONMENT != "cp1"
+      variables:
+        REACT_APP_UAT_MSL_BE_API: "https://uat-gw.singlife.com/dev-apis/pub/msl/integration"
+        REACT_APP_UAT_FLEX_API: "https://uat-gw.singlife.com/dev-apis/pub/msl"
+  script:
+    - if [ $TARGET_ENVIRONMENT == "prd" ] || [ $TARGET_ENVIRONMENT == "dr" ]; then npm run build:prd:ci; else npm run build:ci; fi
+
+Build Staff:
+  <<: *build_jobs_template
+  <<: *install_node_dependencies
+  stage: build-staff
+  tags:
+    - $RUNNER_TAG
+  artifacts:
+    paths: [build-staff/*]
+  variables:
+    REACT_APP_ENABLE_WALKME: $ENABLE_WALKME
+    BUILD_PATH: "./build-staff"
+    REACT_APP_USER_MODE: "staff"
+    REACT_APP_ENV: $TARGET_ENVIRONMENT
+  rules:
+    - if: $UAT_ENVIRONMENT == "cp1"
+      variables:
+        REACT_APP_UAT_MSL_BE_API: "https://uatcp-api-mysinglife.singlife.com"
+        REACT_APP_UAT_FLEX_API: "https://uat-gw.singlife.com/uat-ext/pub/msl"
+    - if: $UAT_ENVIRONMENT != "cp1"
+      variables:
+        REACT_APP_UAT_MSL_BE_API: "https://uat-gw.singlife.com/dev-apis/pub/msl/integration"
+        REACT_APP_UAT_FLEX_API: "https://uat-gw.singlife.com/dev-apis/pub/msl"
+  script:
+    - if [ $TARGET_ENVIRONMENT == "prd" ] || [ $TARGET_ENVIRONMENT == "dr" ]; then npm run build:prd:ci; else npm run build:ci; fi
+
+Upload-CP-Nexus-UAT:
+  stage: upload-nexus
+  tags:
+    - $RUNNER_TAG
+  dependencies: ["Build Customer"]
+  rules:
+    - if: $TARGET_ENVIRONMENT == "uat"
+  variables:
+    BUILD_CP_FILE_NAME: "msl-uat${UAT_ENVIRONMENT}-${CI_PIPELINE_ID}.zip"
+    NEXUS_PATH: "mysinglife-common/frontend/uat"
+  script:
+    - echo "Creating ${BUILD_CP_FILE_NAME} file"
+    - cd build
+    - zip -r ${BUILD_CP_FILE_NAME} .
+    - echo "Uploading ${BUILD_CP_FILE_NAME} in to Nexus repository ${NEXUS_PATH}"
+    - curl --silent --output /dev/null --show-error --fail -u $NEXUS_USERNAME:$NEXUS_PASSWORD  --upload-file ${BUILD_CP_FILE_NAME}
+      https://nexus.tooling.prd.intranet.singlife.com/repository/${NEXUS_PATH}/${BUILD_CP_FILE_NAME}
+
+Upload-CS-Nexus-UAT:
+  stage: upload-nexus
+  tags:
+    - $RUNNER_TAG
+  dependencies: ["Build Staff"]
+  rules:
+    - if: $TARGET_ENVIRONMENT == "uat"
+  variables:
+    BUILD_CS_FILE_NAME: "msl-uat${UAT_ENVIRONMENT}-cs-${CI_PIPELINE_ID}.zip"
+    NEXUS_PATH: "mysinglife-common/frontend/uat"
+  script:
+    - echo "Creating ${BUILD_CS_FILE_NAME} file"
+    - cd build-staff
+    - zip -r ${BUILD_CS_FILE_NAME} .
+    - echo "Uploading ${BUILD_CS_FILE_NAME} in to Nexus repository ${NEXUS_PATH}"
+    - curl --silent --output /dev/null --show-error --fail -u $NEXUS_USERNAME:$NEXUS_PASSWORD  --upload-file ${BUILD_CS_FILE_NAME}
+      https://nexus.tooling.prd.intranet.singlife.com/repository/${NEXUS_PATH}/${BUILD_CS_FILE_NAME}
+
+Upload-CP-Nexus-PRD:
+  stage: upload-nexus
+  tags:
+    - $RUNNER_TAG
+  dependencies: ["Build Customer"]
+  rules:
+    - if: $TARGET_ENVIRONMENT == "prd" || $TARGET_ENVIRONMENT == "dr"
+  variables:
+    BUILD_CP_FILE_NAME: "msl-${TARGET_ENVIRONMENT}-${CI_PIPELINE_ID}.zip"
+    NEXUS_PATH: "mysinglife-common/frontend/${TARGET_ENVIRONMENT}"
+  script:
+    - echo "Creating ${BUILD_CP_FILE_NAME} file"
+    - cd build
+    - zip -r ${BUILD_CP_FILE_NAME} .
+    - echo "Uploading ${BUILD_CP_FILE_NAME} in to Nexus repository ${NEXUS_PATH}"
+    - curl --silent --output /dev/null --show-error --fail -u $NEXUS_USERNAME:$NEXUS_PASSWORD  --upload-file ${BUILD_CP_FILE_NAME}
+      https://nexus.tooling.prd.intranet.singlife.com/repository/${NEXUS_PATH}/${BUILD_CP_FILE_NAME}
+
+Upload-CS-Nexus-PRD:
+  stage: upload-nexus
+  tags:
+    - $RUNNER_TAG
+  dependencies: ["Build Staff"]
+  rules:
+    - if: $TARGET_ENVIRONMENT == "prd" || $TARGET_ENVIRONMENT == "dr"
+  variables:
+    BUILD_CS_FILE_NAME: "msl-${TARGET_ENVIRONMENT}-cs-${CI_PIPELINE_ID}.zip"
+    NEXUS_PATH: "mysinglife-common/frontend/${TARGET_ENVIRONMENT}"
+  script:
+    - echo "Creating ${BUILD_CS_FILE_NAME} file"
+    - cd build-staff
+    - zip -r ${BUILD_CS_FILE_NAME} .
+    - echo "Uploading ${BUILD_CS_FILE_NAME} in to Nexus repository ${NEXUS_PATH}"
+    - curl --silent --output /dev/null --show-error --fail -u $NEXUS_USERNAME:$NEXUS_PASSWORD  --upload-file ${BUILD_CS_FILE_NAME}
+      https://nexus.tooling.prd.intranet.singlife.com/repository/${NEXUS_PATH}/${BUILD_CS_FILE_NAME}
